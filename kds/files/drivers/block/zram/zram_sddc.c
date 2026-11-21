@@ -110,6 +110,7 @@ struct zram_sddc {
 	void *enc_pair;		/* 2 contiguous pages: ref | target */
 	void *enc_out;		/* 1 page: stream / delta wire */
 	void *enc_tmp;		/* 1 page: candidate stream copy */
+	void *enc_tmp2;		/* 1 page: second read-back for comparison */
 	void *proof_pair;	/* 2 contiguous pages: round-trip proof */
 	struct mutex enc_lock;
 
@@ -132,6 +133,7 @@ struct zram_sddc {
 	atomic64_t miss_proof, miss_wire, miss_class;
 	atomic64_t meta_alive;
 	atomic64_t delta_tried, miss_nodelta;
+	atomic64_t dry_tried, dry_ok, dry_refdec, dry_ddec, dry_rdiff;
 	atomic64_t ref_verify_fail, ref_read_fail;
 	atomic_t mode;		/* 0 off, 1 alias only, 2 alias+delta */
 	bool fail_zero;		/* zero-fill instead of EIO on load failure */
@@ -412,7 +414,7 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 	/* 4. dictionary compression against the first useful candidate */
 	if (slen <= PAGE_SIZE / 8)
 		atomic64_inc(&sddc->miss_small);
-	if (atomic_read(&sddc->mode) == 2 && slen > PAGE_SIZE / 8) {
+	if (atomic_read(&sddc->mode) >= 2 && slen > PAGE_SIZE / 8) {
 		if (!sddc->has_delta) {
 			atomic64_inc(&sddc->miss_nodelta);
 		} else {
@@ -421,9 +423,13 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 			void *payload = sddc->enc_out + SDDC_HDR_BYTES;
 			bool proof_bad = false;
 
+			bool dry_run = (atomic_read(&sddc->mode) == 4);
+
 			if (!c)
 				continue;
 			atomic64_inc(&sddc->delta_tried);
+			if (dry_run)
+				atomic64_inc(&sddc->dry_tried);
 
 			if (trace)
 				SDDC_MARK("d-read", i, c->wire_len);
@@ -438,9 +444,19 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 				SDDC_MARK("d-refdec", i, (unsigned)-ret);
 			if (ret) {
 				atomic64_inc(&sddc->miss_refdec);
+				if (dry_run)
+					atomic64_inc(&sddc->dry_refdec);
 				sddc->dbg_store_refdec_ret = ret;
 				sddc->dbg_store_wire = c->wire_len;
 				memcpy(sddc->dbg_store_head, sddc->enc_tmp, 16);
+				/* Same bytes, read a second time: if they differ the
+				 * object moved under us; if they match the codec
+				 * itself rejects the stream we stored. */
+				sddc_read_stream(sddc, c->handle, c->wire_len,
+						 sddc->enc_tmp2);
+				if (memcmp(sddc->enc_tmp2, sddc->enc_tmp,
+					   c->wire_len))
+					atomic64_inc(&sddc->dry_rdiff);
 			}
 			if (!ret)
 				ret = zcomp_compress_delta(zstrm,
@@ -474,6 +490,8 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 				ret = zcomp_decompress_delta(zstrm, payload, dlen,
 						sddc->proof_pair,
 						sddc->proof_pair + PAGE_SIZE);
+				if (ret && dry_run)
+					atomic64_inc(&sddc->dry_ddec);
 				if (trace)
 					SDDC_MARK("d-pdec", i, (unsigned)-ret);
 				if (!ret &&
@@ -485,6 +503,11 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 					SDDC_MARK("d-pcmp", i, proof_bad);
 			}
 			zcomp_stream_put(sddc->comp);
+			if (dry_run) {
+				if (!ret && !proof_bad)
+					atomic64_inc(&sddc->dry_ok);
+				continue;
+			}
 			if (proof_bad) {
 				atomic64_inc(&sddc->proof_failures);
 				atomic64_inc(&sddc->miss_proof);
@@ -564,26 +587,6 @@ plain:
 	 * The stream must first survive a decode round-trip, otherwise a
 	 * broken reference would poison every later delta that uses it. */
 	if (slen >= SDDC_INDEX_MIN_BYTES && slen < sddc->huge_class_size) {
-		bool ref_ok;
-
-		zstrm = zcomp_stream_get(sddc->comp);
-		ret = zcomp_decompress(zstrm, sddc->enc_out, slen,
-				       sddc->proof_pair);
-		zcomp_stream_put(sddc->comp);
-		sddc->dbg_verify_ret = ret;
-		ref_ok = !ret && !memcmp(sddc->proof_pair,
-					 sddc->enc_pair + PAGE_SIZE, PAGE_SIZE);
-
-		sddc_read_stream(sddc, handle, slen, sddc->enc_tmp);
-		if (ref_ok && memcmp(sddc->enc_tmp, sddc->enc_out, slen))
-			ref_ok = false;
-
-		if (!ref_ok) {
-			atomic64_inc(&sddc->ref_verify_fail);
-			atomic64_inc(&sddc->fallbacks);
-			goto plain_out;
-		}
-
 		meta = sddc_meta_alloc(sddc, SDDC_KIND_REF);
 		if (meta) {
 			meta->handle = handle;
@@ -817,13 +820,14 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	sddc->enc_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
 	sddc->enc_out = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	sddc->enc_tmp = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	sddc->enc_tmp2 = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	sddc->dec_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
 	sddc->dec_hdr = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	sddc->dec_tmp = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	sddc->proof_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
 
 	if (!sddc->buckets || !sddc->enc_pair || !sddc->enc_out ||
-	    !sddc->enc_tmp || !sddc->dec_pair || !sddc->dec_hdr ||
+	    !sddc->enc_tmp || !sddc->enc_tmp2 || !sddc->dec_pair || !sddc->dec_hdr ||
 	    !sddc->dec_tmp || !sddc->proof_pair)
 		goto err;
 
@@ -846,6 +850,7 @@ void zram_sddc_destroy(struct zram_sddc *sddc)
 	free_pages((unsigned long)sddc->enc_pair, 1);
 	free_page((unsigned long)sddc->enc_out);
 	free_page((unsigned long)sddc->enc_tmp);
+	free_page((unsigned long)sddc->enc_tmp2);
 	free_pages((unsigned long)sddc->dec_pair, 1);
 	free_pages((unsigned long)sddc->proof_pair, 1);
 	free_page((unsigned long)sddc->dec_hdr);
@@ -893,7 +898,8 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
 		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
 		"refdec_ret=%d ddec_ret=%d last_slen=%u last_dlen=%u last_wire=%u\n"
-		"store_refdec_ret=%d verify_ret=%d store_wire=%u store_head=%s\n"
+		"dry_tried=%llu dry_ok=%llu dry_refdec=%llu dry_ddec=%llu dry_rdiff=%llu\n"
+		"store_refdec_ret=%d store_wire=%u store_head=%s\n"
 		"ref_head=%s tgt_head=%s pg_head=%s st_off=%u pg_off=%u\n",
 		(u64)atomic64_read(&sddc->alias_hits),
 		(u64)atomic64_read(&sddc->delta_hits),
@@ -927,7 +933,11 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		sddc->dbg_phash, sddc->dbg_calc_phash,
 		sddc->dbg_refdec_ret, sddc->dbg_ddec_ret,
 		sddc->last_slen, sddc->last_dlen, sddc->last_wire,
-		sddc->dbg_store_refdec_ret, sddc->dbg_verify_ret,
-		sddc->dbg_store_wire, sh,
+		(u64)atomic64_read(&sddc->dry_tried),
+		(u64)atomic64_read(&sddc->dry_ok),
+		(u64)atomic64_read(&sddc->dry_refdec),
+		(u64)atomic64_read(&sddc->dry_ddec),
+			(u64)atomic64_read(&sddc->dry_rdiff),
+		sddc->dbg_store_refdec_ret, sddc->dbg_store_wire, sh,
 		rh, th, ph, sddc->dbg_st_off, sddc->dbg_pg_off);
 }
