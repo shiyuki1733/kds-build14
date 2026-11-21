@@ -109,6 +109,7 @@ struct zram_sddc {
 	/* encode scratch, serialised by ->enc_lock */
 	void *enc_pair;		/* 2 contiguous pages: ref | target */
 	void *enc_out;		/* 1 page: stream / delta wire */
+	void *enc_plain;	/* 1 page: preserved plain stream */
 	void *enc_tmp;		/* 1 page: candidate stream copy */
 	void *enc_tmp2;		/* 1 page: second read-back for comparison */
 	void *proof_pair;	/* 2 contiguous pages: round-trip proof */
@@ -369,6 +370,7 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 		return -EAGAIN;
 	}
 	memcpy(sddc->enc_out, zstrm->buffer, slen);
+	memcpy(sddc->enc_plain, zstrm->buffer, slen);
 	zcomp_stream_put(sddc->comp);
 	sddc->last_slen = slen;
 
@@ -578,7 +580,7 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 	(void)shash;
 
 plain:
-	if (sddc_zs_write(sddc, sddc->enc_out, slen, &handle)) {
+	if (sddc_zs_write(sddc, sddc->enc_plain, slen, &handle)) {
 		ret = -ENOMEM;
 		goto drop;
 	}
@@ -817,6 +819,7 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 					   sizeof(struct sddc_bucket)));
 	sddc->enc_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
 	sddc->enc_out = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	sddc->enc_plain = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	sddc->enc_tmp = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	sddc->enc_tmp2 = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	sddc->dec_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
@@ -825,7 +828,8 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	sddc->proof_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
 
 	if (!sddc->buckets || !sddc->enc_pair || !sddc->enc_out ||
-	    !sddc->enc_tmp || !sddc->enc_tmp2 || !sddc->dec_pair || !sddc->dec_hdr ||
+	    !sddc->enc_plain || !sddc->enc_tmp || !sddc->enc_tmp2 ||
+	    !sddc->dec_pair || !sddc->dec_hdr ||
 	    !sddc->dec_tmp || !sddc->proof_pair)
 		goto err;
 
@@ -847,6 +851,7 @@ void zram_sddc_destroy(struct zram_sddc *sddc)
 	vfree(sddc->buckets);
 	free_pages((unsigned long)sddc->enc_pair, 1);
 	free_page((unsigned long)sddc->enc_out);
+	free_page((unsigned long)sddc->enc_plain);
 	free_page((unsigned long)sddc->enc_tmp);
 	free_page((unsigned long)sddc->enc_tmp2);
 	free_pages((unsigned long)sddc->dec_pair, 1);
