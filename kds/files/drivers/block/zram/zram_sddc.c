@@ -867,8 +867,8 @@ void zram_sddc_mode_set(struct zram_sddc *sddc, int mode)
 		return;
 	if (mode < 0)
 		mode = 0;
-	if (mode > 2)
-		mode = 2;
+	if (mode > 4)
+		mode = 4;
 	atomic_set(&sddc->mode, mode);
 }
 
