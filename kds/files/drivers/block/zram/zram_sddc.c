@@ -132,6 +132,7 @@ struct zram_sddc {
 	atomic64_t miss_proof, miss_wire, miss_class;
 	atomic64_t meta_alive;
 	atomic64_t delta_tried, miss_nodelta;
+	atomic64_t ref_verify_fail, ref_read_fail;
 	atomic_t mode;		/* 0 off, 1 alias only, 2 alias+delta */
 	bool fail_zero;		/* zero-fill instead of EIO on load failure */
 	char comp_name[16];
@@ -143,6 +144,7 @@ struct zram_sddc {
 	u32 dbg_ref_hash, dbg_hdr_ref, dbg_phash, dbg_calc_phash;
 	int dbg_refdec_ret, dbg_ddec_ret;
 	int dbg_store_refdec_ret;
+	int dbg_verify_ret;
 	u32 dbg_store_wire;
 	u8 dbg_store_head[16];
 	u32 last_slen, last_dlen, last_wire;
@@ -558,8 +560,30 @@ plain:
 		goto drop;
 	}
 
-	/* 5. promote the new slot to a reference when it is worth indexing */
+	/* 5. promote the new slot to a reference when it is worth indexing.
+	 * The stream must first survive a decode round-trip, otherwise a
+	 * broken reference would poison every later delta that uses it. */
 	if (slen >= SDDC_INDEX_MIN_BYTES && slen < sddc->huge_class_size) {
+		bool ref_ok;
+
+		zstrm = zcomp_stream_get(sddc->comp);
+		ret = zcomp_decompress(zstrm, sddc->enc_out, slen,
+				       sddc->proof_pair);
+		zcomp_stream_put(sddc->comp);
+		sddc->dbg_verify_ret = ret;
+		ref_ok = !ret && !memcmp(sddc->proof_pair,
+					 sddc->enc_pair + PAGE_SIZE, PAGE_SIZE);
+
+		sddc_read_stream(sddc, handle, slen, sddc->enc_tmp);
+		if (ref_ok && memcmp(sddc->enc_tmp, sddc->enc_out, slen))
+			ref_ok = false;
+
+		if (!ref_ok) {
+			atomic64_inc(&sddc->ref_verify_fail);
+			atomic64_inc(&sddc->fallbacks);
+			goto plain_out;
+		}
+
 		meta = sddc_meta_alloc(sddc, SDDC_KIND_REF);
 		if (meta) {
 			meta->handle = handle;
@@ -577,6 +601,8 @@ plain:
 		}
 		atomic64_inc(&sddc->fallbacks);
 	}
+
+plain_out:
 
 	out->meta = NULL;
 	out->handle = handle;
@@ -632,6 +658,9 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 		}
 		kunmap_atomic(pagebuf);
 		if (ret) {
+			sddc->dbg_refdec_ret = ret;
+			memcpy(sddc->dbg_ref_head, sddc->dec_tmp, 16);
+			sddc->dbg_stage = (meta->kind == SDDC_KIND_REF) ? 4 : 5;
 			atomic64_inc(&sddc->re_plain);
 			atomic64_inc(&sddc->read_errors);
 		}
@@ -775,7 +804,7 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	spin_lock_init(&sddc->dec_lock);
 	atomic_set(&sddc->mode, 2);
 	atomic_set(&sddc->next_gen, 0);
-	sddc->fail_zero = true;
+	sddc->fail_zero = false;
 	sddc->free_wq = alloc_workqueue("kds-sddc-free", WQ_UNBOUND, 0);
 	if (!sddc->free_wq)
 		goto err;
@@ -859,12 +888,12 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 	sh[32] = 0;
 	return scnprintf(buf, len,
 		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu load_entries=%llu\n"
-		"re_pin=%llu re_plain=%llu re_hdr=%llu re_refdec=%llu re_ddec=%llu\n"
+		"re_pin=%llu re_plain=%llu re_hdr=%llu re_refdec=%llu re_ddec=%llu refverify=%llu\n"
 		"store=%llu cand=%llu miss_small=%llu miss_refdec=%llu miss_enc=%llu miss_size=%llu miss_proof=%llu miss_wire=%llu miss_class=%llu meta_alive=%lld mode=%d comp=%s has_delta=%d tried=%llu nodelta=%llu\n"
 		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
 		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
 		"refdec_ret=%d ddec_ret=%d last_slen=%u last_dlen=%u last_wire=%u\n"
-		"store_refdec_ret=%d store_wire=%u store_head=%s\n"
+		"store_refdec_ret=%d verify_ret=%d store_wire=%u store_head=%s\n"
 		"ref_head=%s tgt_head=%s pg_head=%s st_off=%u pg_off=%u\n",
 		(u64)atomic64_read(&sddc->alias_hits),
 		(u64)atomic64_read(&sddc->delta_hits),
@@ -877,6 +906,7 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		(u64)atomic64_read(&sddc->re_hdr),
 		(u64)atomic64_read(&sddc->re_refdec),
 		(u64)atomic64_read(&sddc->re_ddec),
+		(u64)atomic64_read(&sddc->ref_verify_fail),
 		(u64)atomic64_read(&sddc->store_total),
 		(u64)atomic64_read(&sddc->cand_total),
 		(u64)atomic64_read(&sddc->miss_small),
@@ -897,6 +927,7 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		sddc->dbg_phash, sddc->dbg_calc_phash,
 		sddc->dbg_refdec_ret, sddc->dbg_ddec_ret,
 		sddc->last_slen, sddc->last_dlen, sddc->last_wire,
-		sddc->dbg_store_refdec_ret, sddc->dbg_store_wire, sh,
+		sddc->dbg_store_refdec_ret, sddc->dbg_verify_ret,
+		sddc->dbg_store_wire, sh,
 		rh, th, ph, sddc->dbg_st_off, sddc->dbg_pg_off);
 }
