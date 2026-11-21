@@ -1,0 +1,9 @@
+config ZRAM_SDDC
+	bool "Slot deduplication with dictionary compression (kds)"
+	depends on ZRAM
+	depends on CRYPTO_LZ4KD
+	default n
+	help
+	  Enable SDDC for the lz4kds backend: identical compressed slots share
+	  one zsmalloc object (ALIAS) and similar pages are stored as LZ4KD
+	  dictionary coded streams relative to a reference page (DELTA).

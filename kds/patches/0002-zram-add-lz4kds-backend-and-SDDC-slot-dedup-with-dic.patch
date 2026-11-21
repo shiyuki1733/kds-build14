@@ -1,0 +1,1155 @@
+From bc0c56ab4b5eb2ee306b4624252ab41aa3f9aaef Mon Sep 17 00:00:00 2001
+From: k <a@b>
+Date: Thu, 19 Nov 2026 22:16:26 +0800
+Subject: [PATCH 2/2] zram: add lz4kds backend and SDDC slot dedup with
+ dictionary compression
+
+---
+ drivers/block/zram/Makefile      |   1 +
+ drivers/block/zram/zcomp.c       | 121 ++++++-
+ drivers/block/zram/zcomp.h       |  37 ++
+ drivers/block/zram/zram_drv.c    |  56 +++
+ drivers/block/zram/zram_drv.h    |   7 +
+ drivers/block/zram/zram_lz4kds.c |  88 +++++
+ drivers/block/zram/zram_sddc.c   | 584 +++++++++++++++++++++++++++++++
+ drivers/block/zram/zram_sddc.h   |  32 ++
+ 8 files changed, 924 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/block/zram/zram_lz4kds.c
+ create mode 100644 drivers/block/zram/zram_sddc.c
+ create mode 100644 drivers/block/zram/zram_sddc.h
+
+diff --git a/drivers/block/zram/Makefile b/drivers/block/zram/Makefile
+index de9e457..5110e39 100644
+--- a/drivers/block/zram/Makefile
++++ b/drivers/block/zram/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ zram-y	:=	zcomp.o zram_drv.o
++zram-$(CONFIG_ZRAM_SDDC)	+=	zram_sddc.o zram_lz4kds.o
+ 
+ obj-$(CONFIG_ZRAM)	+=	zram.o
+diff --git a/drivers/block/zram/zcomp.c b/drivers/block/zram/zcomp.c
+index 0916de9..6fe40ad 100644
+--- a/drivers/block/zram/zcomp.c
++++ b/drivers/block/zram/zcomp.c
+@@ -7,6 +7,7 @@
+ #include <linux/string.h>
+ #include <linux/err.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
+ #include <linux/wait.h>
+ #include <linux/sched.h>
+ #include <linux/cpu.h>
+@@ -14,6 +15,10 @@
+ 
+ #include "zcomp.h"
+ 
++#if IS_ENABLED(CONFIG_ZRAM_SDDC)
++extern const struct zcomp_backend_ops lz4kds_zcomp_ops;
++#endif
++
+ static const char * const backends[] = {
+ #if IS_ENABLED(CONFIG_CRYPTO_LZO)
+ 	"lzo",
+@@ -25,6 +30,21 @@ static const char * const backends[] = {
+ #if IS_ENABLED(CONFIG_CRYPTO_LZ4HC)
+ 	"lz4hc",
+ #endif
++#if IS_ENABLED(CONFIG_CRYPTO_LZ4K)
++	"lz4k",
++#endif
++#if IS_ENABLED(CONFIG_CRYPTO_LZ4K_OPLUS)
++	"lz4k_oplus",
++#endif
++#if IS_ENABLED(CONFIG_CRYPTO_LZ4KD)
++	"lz4kd",
++#endif
++#if IS_ENABLED(CONFIG_CRYPTO_DEFLATE)
++	"deflate",
++#endif
++#if IS_ENABLED(CONFIG_ZRAM_SDDC)
++	"lz4kds",
++#endif
+ #if IS_ENABLED(CONFIG_CRYPTO_842)
+ 	"842",
+ #endif
+@@ -33,12 +53,25 @@ static const char * const backends[] = {
+ #endif
+ };
+ 
++/* Backends implemented directly, bypassing the crypto compress API. */
++static const struct zcomp_backend_ops *zcomp_direct_ops(const char *name)
++{
++#if IS_ENABLED(CONFIG_ZRAM_SDDC)
++	if (!strcmp(name, "lz4kds"))
++		return &lz4kds_zcomp_ops;
++#endif
++	return NULL;
++}
++
+ static void zcomp_strm_free(struct zcomp_strm *zstrm)
+ {
+ 	if (!IS_ERR_OR_NULL(zstrm->tfm))
+ 		crypto_free_comp(zstrm->tfm);
++	vfree(zstrm->ctx);
+ 	free_pages((unsigned long)zstrm->buffer, 1);
+ 	zstrm->tfm = NULL;
++	zstrm->ctx = NULL;
++	zstrm->ops = NULL;
+ 	zstrm->buffer = NULL;
+ }
+ 
+@@ -48,13 +81,25 @@ static void zcomp_strm_free(struct zcomp_strm *zstrm)
+  */
+ static int zcomp_strm_init(struct zcomp_strm *zstrm, struct zcomp *comp)
+ {
+-	zstrm->tfm = crypto_alloc_comp(comp->name, 0, 0);
++	zstrm->ops = comp->ops;
++	if (comp->ops) {
++		if (comp->ops->ctx_size) {
++			zstrm->ctx = vmalloc(comp->ops->ctx_size);
++			if (!zstrm->ctx)
++				return -ENOMEM;
++			memset(zstrm->ctx, 0, comp->ops->ctx_size);
++		}
++	} else {
++		zstrm->tfm = crypto_alloc_comp(comp->name, 0, 0);
++		if (IS_ERR_OR_NULL(zstrm->tfm))
++			return -ENOMEM;
++	}
+ 	/*
+ 	 * allocate 2 pages. 1 for compressed data, plus 1 extra for the
+ 	 * case when compressed size is larger than the original one
+ 	 */
+ 	zstrm->buffer = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
+-	if (IS_ERR_OR_NULL(zstrm->tfm) || !zstrm->buffer) {
++	if (!zstrm->buffer) {
+ 		zcomp_strm_free(zstrm);
+ 		return -ENOMEM;
+ 	}
+@@ -63,6 +108,8 @@ static int zcomp_strm_init(struct zcomp_strm *zstrm, struct zcomp *comp)
+ 
+ bool zcomp_available_algorithm(const char *comp)
+ {
++	if (zcomp_direct_ops(comp))
++		return true;
+ 	/*
+ 	 * Crypto does not ignore a trailing new line symbol,
+ 	 * so make sure you don't supply a string containing
+@@ -133,6 +180,18 @@ int zcomp_compress(struct zcomp_strm *zstrm,
+ 	 */
+ 	*dst_len = PAGE_SIZE * 2;
+ 
++	if (zstrm->ops) {
++		size_t len = *dst_len;
++		int ret;
++
++		ret = zstrm->ops->compress(zstrm->ctx, src, PAGE_SIZE,
++					   zstrm->buffer, &len);
++		if (ret)
++			return ret;
++		*dst_len = (unsigned int)len;
++		return 0;
++	}
++
+ 	return crypto_comp_compress(zstrm->tfm,
+ 			src, PAGE_SIZE,
+ 			zstrm->buffer, dst_len);
+@@ -143,11 +202,68 @@ int zcomp_decompress(struct zcomp_strm *zstrm,
+ {
+ 	unsigned int dst_len = PAGE_SIZE;
+ 
++	if (zstrm->ops) {
++		size_t len = dst_len;
++		int ret;
++
++		ret = zstrm->ops->decompress(zstrm->ctx, src, src_len,
++					     dst, &len);
++		if (ret)
++			return ret;
++		if (len != PAGE_SIZE)
++			return -EINVAL;
++		return 0;
++	}
++
+ 	return crypto_comp_decompress(zstrm->tfm,
+ 			src, src_len,
+ 			dst, &dst_len);
+ }
+ 
++bool zcomp_has_delta(struct zcomp *comp)
++{
++	return comp->ops && comp->ops->compress_delta &&
++		comp->ops->decompress_delta;
++}
++
++int zcomp_compress_delta(struct zcomp_strm *zstrm, const void *ref,
++		const void *dst_page, unsigned int *dst_len, unsigned int out_max)
++{
++	size_t len;
++	int ret;
++
++	if (!zstrm->ops || !zstrm->ops->compress_delta)
++		return -EOPNOTSUPP;
++
++	len = out_max;
++	ret = zstrm->ops->compress_delta(zstrm->ctx, ref, dst_page, PAGE_SIZE,
++					 zstrm->buffer, &len, out_max);
++	if (ret)
++		return ret;
++	if (len > out_max)
++		return -EINVAL;
++	*dst_len = (unsigned int)len;
++	return 0;
++}
++
++int zcomp_decompress_delta(struct zcomp_strm *zstrm, const void *src,
++		unsigned int src_len, const void *ref, void *dst)
++{
++	size_t len = PAGE_SIZE;
++	int ret;
++
++	if (!zstrm->ops || !zstrm->ops->decompress_delta)
++		return -EOPNOTSUPP;
++
++	ret = zstrm->ops->decompress_delta(zstrm->ctx, src, src_len, ref,
++					   dst, &len);
++	if (ret)
++		return ret;
++	if (len != PAGE_SIZE)
++		return -EINVAL;
++	return 0;
++}
++
+ int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
+ {
+ 	struct zcomp *comp = hlist_entry(node, struct zcomp, node);
+@@ -224,6 +340,7 @@ struct zcomp *zcomp_create(const char *compress)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	comp->name = compress;
++	comp->ops = zcomp_direct_ops(compress);
+ 	error = zcomp_init(comp);
+ 	if (error) {
+ 		kfree(comp);
+diff --git a/drivers/block/zram/zcomp.h b/drivers/block/zram/zcomp.h
+index 40f6420..4f63ca3 100644
+--- a/drivers/block/zram/zcomp.h
++++ b/drivers/block/zram/zcomp.h
+@@ -7,18 +7,47 @@
+ #define _ZCOMP_H_
+ #include <linux/local_lock.h>
+ 
++/*
++ * Direct (non crypto API) compression backend.  Needed by algorithms that
++ * carry more per-cpu state than the crypto compress API can hold, or that
++ * implement delta (dictionary) compression, which the crypto API has no
++ * interface for.
++ *
++ * ->decompress may run from the zram read path while the slot bit spinlock
++ * is held, so it must never sleep.
++ */
++struct zcomp_backend_ops {
++	int (*compress)(void *ctx, const void *src, size_t src_len,
++			void *dst, size_t *dst_len);
++	int (*decompress)(void *ctx, const void *src, size_t src_len,
++			void *dst, size_t *dst_len);
++	/* Optional dictionary compression against a reference page. */
++	int (*compress_delta)(void *ctx, const void *ref, const void *src,
++			      size_t src_len, void *dst, size_t *dst_len,
++			      size_t out_max);
++	int (*decompress_delta)(void *ctx, const void *src, size_t src_len,
++				const void *ref, void *dst, size_t *dst_len);
++	/* Size of the per-cpu context, 0 when the backend needs none. */
++	size_t ctx_size;
++};
++
+ struct zcomp_strm {
+ 	/* The members ->buffer and ->tfm are protected by ->lock. */
+ 	local_lock_t lock;
+ 	/* compression/decompression buffer */
+ 	void *buffer;
+ 	struct crypto_comp *tfm;
++	/* direct backend context (per-cpu) */
++	void *ctx;
++	/* non-NULL when this stream uses a direct backend */
++	const struct zcomp_backend_ops *ops;
+ };
+ 
+ /* dynamic per-device compression frontend */
+ struct zcomp {
+ 	struct zcomp_strm __percpu *stream;
+ 	const char *name;
++	const struct zcomp_backend_ops *ops;
+ 	struct hlist_node node;
+ };
+ 
+@@ -40,4 +69,12 @@ int zcomp_decompress(struct zcomp_strm *zstrm,
+ 		const void *src, unsigned int src_len, void *dst);
+ 
+ bool zcomp_set_max_streams(struct zcomp *comp, int num_strm);
++
++/* Delta (dictionary) compression; available only on kds style backends. */
++bool zcomp_has_delta(struct zcomp *comp);
++int zcomp_compress_delta(struct zcomp_strm *zstrm, const void *ref,
++		const void *src, unsigned int *dst_len, unsigned int out_max);
++int zcomp_decompress_delta(struct zcomp_strm *zstrm, const void *src,
++		unsigned int src_len, const void *ref, void *dst);
++
+ #endif /* _ZCOMP_H_ */
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index fb99592..2c04a87 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -35,6 +35,9 @@
+ #include <linux/part_stat.h>
+ 
+ #include "zram_drv.h"
++#ifdef CONFIG_ZRAM_SDDC
++#include "zram_sddc.h"
++#endif
+ 
+ static DEFINE_IDR(zram_index_idr);
+ /* idr index must be protected */
+@@ -1175,6 +1178,10 @@ static void zram_meta_free(struct zram *zram, u64 disksize)
+ 	for (index = 0; index < num_pages; index++)
+ 		zram_free_page(zram, index);
+ 
++#ifdef CONFIG_ZRAM_SDDC
++	zram_sddc_destroy(zram->sddc);
++	zram->sddc = NULL;
++#endif
+ 	zs_destroy_pool(zram->mem_pool);
+ 	vfree(zram->table);
+ 	zram->table = NULL;
+@@ -1237,6 +1244,16 @@ static void zram_free_page(struct zram *zram, size_t index)
+ 		goto out;
+ 	}
+ 
++#ifdef CONFIG_ZRAM_SDDC
++	if (zram_test_flag(zram, index, ZRAM_SDDC)) {
++		zram_clear_flag(zram, index, ZRAM_SDDC);
++		atomic64_sub(zram_get_obj_size(zram, index),
++				&zram->stats.compr_data_size);
++		zram_sddc_free_slot(zram->sddc,
++				(void *)zram_get_handle(zram, index));
++		goto out;
++	}
++#endif
+ 	handle = zram_get_handle(zram, index);
+ 	if (!handle)
+ 		return;
+@@ -1263,6 +1280,15 @@ static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
+ 	int ret;
+ 
+ 	zram_slot_lock(zram, index);
++#ifdef CONFIG_ZRAM_SDDC
++	if (zram_test_flag(zram, index, ZRAM_SDDC)) {
++		ret = zram_sddc_load(zram->sddc,
++				(void *)zram_get_handle(zram, index), page);
++		zram_slot_unlock(zram, index);
++		WARN_ON_ONCE(ret);
++		return ret;
++	}
++#endif
+ 	if (zram_test_flag(zram, index, ZRAM_WB)) {
+ 		struct bio_vec bvec;
+ 
+@@ -1373,6 +1399,33 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 	}
+ 	kunmap_atomic(mem);
+ 
++#ifdef CONFIG_ZRAM_SDDC
++	if (zram->sddc) {
++		struct zram_sddc_store st;
++
++		if (!zram_sddc_store(zram->sddc, page, &st)) {
++			comp_len = st.size;
++			handle = st.handle;
++
++			zram_slot_lock(zram, index);
++			zram_free_page(zram, index);
++			if (st.meta) {
++				zram_set_handle(zram, index,
++						(unsigned long)st.meta);
++				zram_set_flag(zram, index, ZRAM_SDDC);
++			} else {
++				zram_set_handle(zram, index, st.handle);
++			}
++			zram_set_obj_size(zram, index, comp_len);
++			zram_slot_unlock(zram, index);
++
++			atomic64_add(comp_len, &zram->stats.compr_data_size);
++			atomic64_inc(&zram->stats.pages_stored);
++			return 0;
++		}
++	}
++#endif
++
+ compress_again:
+ 	zstrm = zcomp_stream_get(zram->comp);
+ 	src = kmap_atomic(page);
+@@ -1777,6 +1830,9 @@ static ssize_t disksize_store(struct device *dev,
+ 	}
+ 
+ 	zram->comp = comp;
++#ifdef CONFIG_ZRAM_SDDC
++	zram->sddc = zram_sddc_create(zram->mem_pool, comp, huge_class_size);
++#endif
+ 	zram->disksize = disksize;
+ 	set_capacity_and_notify(zram->disk, zram->disksize >> SECTOR_SHIFT);
+ 	up_write(&zram->init_lock);
+diff --git a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+index a2bda53..73a6549 100644
+--- a/drivers/block/zram/zram_drv.h
++++ b/drivers/block/zram/zram_drv.h
+@@ -20,6 +20,9 @@
+ #include <linux/crypto.h>
+ 
+ #include "zcomp.h"
++#ifdef CONFIG_ZRAM_SDDC
++struct zram_sddc;
++#endif
+ 
+ #define SECTORS_PER_PAGE_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+ #define SECTORS_PER_PAGE	(1 << SECTORS_PER_PAGE_SHIFT)
+@@ -49,6 +52,7 @@ enum zram_pageflags {
+ 	ZRAM_UNDER_WB,	/* page is under writeback */
+ 	ZRAM_HUGE,	/* Incompressible page */
+ 	ZRAM_IDLE,	/* not accessed page since last idle marking */
++	ZRAM_SDDC,	/* slot owned by the SDDC layer, table->handle is meta */
+ 
+ 	__NR_ZRAM_PAGEFLAGS,
+ };
+@@ -93,6 +97,9 @@ struct zram {
+ 	struct zram_table_entry *table;
+ 	struct zs_pool *mem_pool;
+ 	struct zcomp *comp;
++#ifdef CONFIG_ZRAM_SDDC
++	struct zram_sddc *sddc;
++#endif
+ 	struct gendisk *disk;
+ 	/* Prevent concurrent execution of device init */
+ 	struct rw_semaphore init_lock;
+diff --git a/drivers/block/zram/zram_lz4kds.c b/drivers/block/zram/zram_lz4kds.c
+new file mode 100644
+index 0000000..cc1e65e
+--- /dev/null
++++ b/drivers/block/zram/zram_lz4kds.c
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * LZ4KDS ("kds") direct zcomp backend.
++ *
++ * lz4kd is a plain 4 KiB block codec which also implements dictionary (delta)
++ * compression: lz4kd_encode_delta() compresses a page using a reference page
++ * as dictionary, which is what SDDC delta slots need.  The crypto compress
++ * API has no delta interface and cannot carry the codec's per-cpu state, so
++ * the codec is driven directly.
++ *
++ * The reference and target pages must be physically contiguous for the delta
++ * calls (see lz4kd_encode_delta() documentation); the SDDC layer hands us a
++ * paired 8 KiB buffer and copies the reference page in front of the target.
++ */
++
++#include <linux/kernel.h>
++#include <linux/lz4kd.h>
++#include <linux/mm.h>
++#include <linux/vmalloc.h>
++
++#include "zcomp.h"
++
++/* Matches lz4kd_encode_state_bytes_min(): 13-bit hash + offset table. */
++#define LZ4KDS_ENC_STATE_BYTES	(1U << 15)
++
++static int lz4kds_compress(void *ctx, const void *src, size_t src_len,
++			   void *dst, size_t *dst_len)
++{
++	int ret;
++
++	if (src_len != PAGE_SIZE)
++		return -EINVAL;
++
++	ret = lz4kd_encode(ctx, src, dst, src_len, *dst_len, 0);
++	if (ret <= 0)
++		return -EINVAL;
++	*dst_len = ret;
++	return 0;
++}
++
++static int lz4kds_decompress(void *ctx, const void *src, size_t src_len,
++			     void *dst, size_t *dst_len)
++{
++	int ret;
++
++	ret = lz4kd_decode(src, dst, src_len, *dst_len);
++	if (ret <= 0)
++		return -EINVAL;
++	*dst_len = ret;
++	return 0;
++}
++
++static int lz4kds_compress_delta(void *ctx, const void *ref, const void *src,
++				 size_t src_len, void *dst, size_t *dst_len,
++				 size_t out_max)
++{
++	int ret;
++
++	if (src_len != PAGE_SIZE)
++		return -EINVAL;
++
++	ret = lz4kd_encode_delta(ctx, ref, src, dst, src_len, *dst_len,
++				 out_max);
++	if (ret <= 0)
++		return -EINVAL;
++	*dst_len = ret;
++	return 0;
++}
++
++static int lz4kds_decompress_delta(void *ctx, const void *src, size_t src_len,
++				   const void *ref, void *dst, size_t *dst_len)
++{
++	int ret;
++
++	ret = lz4kd_decode_delta(src, ref, dst, src_len, *dst_len);
++	if (ret <= 0)
++		return -EINVAL;
++	*dst_len = ret;
++	return 0;
++}
++
++const struct zcomp_backend_ops lz4kds_zcomp_ops = {
++	.compress = lz4kds_compress,
++	.decompress = lz4kds_decompress,
++	.compress_delta = lz4kds_compress_delta,
++	.decompress_delta = lz4kds_decompress_delta,
++	.ctx_size = LZ4KDS_ENC_STATE_BYTES,
++};
+diff --git a/drivers/block/zram/zram_sddc.c b/drivers/block/zram/zram_sddc.c
+new file mode 100644
+index 0000000..35e28a6
+--- /dev/null
++++ b/drivers/block/zram/zram_sddc.c
+@@ -0,0 +1,584 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SDDC: slot deduplication with dictionary (delta) compression for zram.
++ *
++ * Slot kinds on top of the ordinary compressed slot:
++ *
++ *   REF    a slot whose compressed stream stays addressable so later pages can
++ *          be compressed against it.  It owns its zsmalloc handle.
++ *   ALIAS  a slot whose compressed stream is byte identical to a REF; it stores
++ *          no data at all and just points at the REF.
++ *   DELTA  a slot stored as a dictionary coded stream relative to a REF.
++ *
++ * Lifetime: a REF is pinned by its dependents (meta->dependents).  When the
++ * slot index of a REF is freed or overwritten the metadata survives as an
++ * orphan and keeps the zsmalloc handle alive until the last dependent goes
++ * away, so a dependent can never read a recycled reference.  The reference
++ * graph is one level deep: only REF slots are referenced and REF slots have
++ * no reference of their own.
++ *
++ * Locking: ->bucket_lock protects the candidate buckets and the
++ * orphan/index transitions only; every pointer handed out is pinned with
++ * ->dependents while the lock is held.  zsmalloc mapping and codec calls
++ * always run outside that lock, so no sleeping operation happens under a
++ * spinlock.
++ *
++ * All of this is a pure cache: any failure falls back to an ordinary
++ * compressed slot.
++ */
++
++#include <linux/highmem.h>
++#include <linux/jhash.h>
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/vmalloc.h>
++#include <linux/zsmalloc.h>
++
++#include "zcomp.h"
++#include "zram_sddc.h"
++
++#define SDDC_MAGIC		0x43444453	/* "SDDC" */
++#define SDDC_VERSION		1
++#define SDDC_HDR_BYTES		24
++#define SDDC_INDEX_MIN_BYTES	256
++#define SDDC_MAX_CANDIDATES	4
++#define SDDC_BUCKET_BITS	14
++#define SDDC_BUCKETS		(1U << SDDC_BUCKET_BITS)
++#define SDDC_BUCKET_WAYS	6
++#define SDDC_HASH_SEED		0x9e3779b9
++
++enum sddc_kind {
++	SDDC_KIND_REF = 1,
++	SDDC_KIND_ALIAS,
++	SDDC_KIND_DELTA,
++};
++
++struct sddc_wire_hdr {
++	u32 magic;
++	u16 version;
++	u16 kind;
++	u32 ref_hash;
++	u32 target_len;
++	u32 payload_len;
++	u32 payload_hash;
++	u32 reserved;
++} __packed;
++
++struct sddc_meta {
++	struct sddc_meta *ref;	/* reference slot, NULL for REF */
++	unsigned long handle;	/* own stream (REF and DELTA only) */
++	int dependents;
++	int orphan;
++	int kind;
++	u32 stream_hash;	/* hash of own stream; for DELTA the ref's hash */
++	u32 sample_hash;	/* head/tail page sample hash, bucket key */
++	u16 wire_len;		/* bytes stored in zsmalloc */
++	u16 target_len;
++};
++
++struct sddc_bucket {
++	struct sddc_meta *slot[SDDC_BUCKET_WAYS];
++};
++
++struct zram_sddc {
++	struct zs_pool *pool;
++	struct zcomp *comp;
++	unsigned long huge_class_size;
++
++	struct sddc_bucket *buckets;
++	spinlock_t bucket_lock;
++
++	/* encode scratch, serialised by ->enc_lock */
++	void *enc_pair;		/* 2 contiguous pages: ref | target */
++	void *enc_out;		/* 1 page: stream / delta wire */
++	void *enc_tmp;		/* 1 page: candidate stream copy */
++	struct mutex enc_lock;
++
++	/* decode scratch, serialised by ->dec_lock */
++	void *dec_pair;		/* 2 contiguous pages: ref | target */
++	void *dec_hdr;		/* 1 page: delta wire */
++	void *dec_tmp;		/* 1 page: candidate stream copy */
++	spinlock_t dec_lock;
++
++	atomic64_t alias_hits;
++	atomic64_t delta_hits;
++	atomic64_t fallbacks;
++	atomic64_t read_errors;
++};
++
++static u32 sddc_hash_bytes(const void *buf, unsigned int len)
++{
++	return jhash(buf, len, SDDC_HASH_SEED);
++}
++
++/*
++ * Sample hash over the first and the last 16 bytes of the page.  Similar
++ * pages share it, which is what the delta candidate search needs.
++ */
++static u32 sddc_sample_hash(const u8 *page)
++{
++	u32 head = jhash(page, 16, SDDC_HASH_SEED);
++	u32 tail = jhash(page + PAGE_SIZE - 16, 16, SDDC_HASH_SEED);
++
++	return head ^ rol32(tail, 13);
++}
++
++static struct sddc_bucket *sddc_bucket(struct zram_sddc *sddc, u32 hash)
++{
++	return &sddc->buckets[hash >> (32 - SDDC_BUCKET_BITS)];
++}
++
++static int sddc_zs_write(struct zram_sddc *sddc, const void *buf,
++			 unsigned int len, unsigned long *handle)
++{
++	void *dst;
++
++	*handle = zs_malloc(sddc->pool, len,
++			    GFP_NOIO | __GFP_HIGHMEM | __GFP_MOVABLE);
++	if (IS_ERR((void *)*handle))
++		return -ENOMEM;
++
++	dst = zs_map_object(sddc->pool, *handle, ZS_MM_WO);
++	memcpy(dst, buf, len);
++	zs_unmap_object(sddc->pool, *handle);
++	return 0;
++}
++
++static void sddc_read_stream(struct zram_sddc *sddc, unsigned long handle,
++			     unsigned int len, void *buf)
++{
++	void *src;
++
++	if (!handle)
++		return;
++	src = zs_map_object(sddc->pool, handle, ZS_MM_RO);
++	memcpy(buf, src, len);
++	zs_unmap_object(sddc->pool, handle);
++}
++
++/* Drop a pin; the last pin of an orphaned metadata frees it. */
++static void sddc_put(struct zram_sddc *sddc, struct sddc_meta *meta)
++{
++	bool last;
++
++	if (!meta)
++		return;
++
++	spin_lock(&sddc->bucket_lock);
++	last = (--meta->dependents == 0) && meta->orphan;
++	spin_unlock(&sddc->bucket_lock);
++
++	if (last) {
++		if (meta->handle)
++			zs_free(sddc->pool, meta->handle);
++		kfree(meta);
++	}
++}
++
++/* Pin a candidate while the bucket lock is held. */
++static struct sddc_meta *sddc_get_locked(struct zram_sddc *sddc,
++					 struct sddc_meta *meta)
++{
++	if (!meta || meta->kind != SDDC_KIND_REF || meta->orphan)
++		return NULL;
++	meta->dependents++;
++	return meta;
++}
++
++static void sddc_unindex(struct zram_sddc *sddc, struct sddc_meta *meta)
++{
++	struct sddc_bucket *b = sddc_bucket(sddc, meta->sample_hash);
++	int i;
++
++	for (i = 0; i < SDDC_BUCKET_WAYS; i++) {
++		if (b->slot[i] == meta) {
++			b->slot[i] = NULL;
++			return;
++		}
++	}
++}
++
++static void sddc_index(struct zram_sddc *sddc, struct sddc_meta *meta)
++{
++	struct sddc_bucket *b = sddc_bucket(sddc, meta->sample_hash);
++	int i, victim;
++
++	for (i = 0; i < SDDC_BUCKET_WAYS; i++) {
++		if (b->slot[i] == meta)
++			return;
++	}
++	for (i = 0; i < SDDC_BUCKET_WAYS; i++) {
++		if (!b->slot[i]) {
++			b->slot[i] = meta;
++			return;
++		}
++	}
++	/* Bucket full: replace a random-ish entry, the old REF stays valid. */
++	victim = sddc_hash_bytes(meta, sizeof(meta)) % SDDC_BUCKET_WAYS;
++	b->slot[victim] = meta;
++}
++
++/*
++ * Store @page.  Returns 0 with @out filled in; -ENOMEM when the allocation
++ * itself failed; -EAGAIN when the caller must use the compression it already
++ * performed elsewhere.
++ */
++static int sddc_store(struct zram_sddc *sddc, struct page *page,
++		      struct zram_sddc_store *out);
++
++int zram_sddc_store(struct zram_sddc *sddc, struct page *page,
++		    struct zram_sddc_store *out)
++{
++	int ret;
++
++	mutex_lock(&sddc->enc_lock);
++	ret = sddc_store(sddc, page, out);
++	mutex_unlock(&sddc->enc_lock);
++	return ret;
++}
++
++static int sddc_store(struct zram_sddc *sddc, struct page *page,
++		      struct zram_sddc_store *out)
++{
++	struct zcomp_strm *zstrm;
++	struct sddc_meta *cand[SDDC_MAX_CANDIDATES];
++	struct sddc_meta *meta = NULL;
++	struct sddc_bucket *bucket;
++	const u8 *pagebuf;
++	unsigned long handle = 0;
++	unsigned int slen = 0, dlen = 0, wire_len;
++	u32 sample, shash;
++	int i, ncand = 0, ret = 0, sel = -1;
++
++	pagebuf = kmap_atomic(page);
++	memcpy(sddc->enc_pair + PAGE_SIZE, pagebuf, PAGE_SIZE);
++	sample = sddc_sample_hash(pagebuf);
++	kunmap_atomic((void *)pagebuf);
++
++	/* 1. plain compression of the page */
++	zstrm = zcomp_stream_get(sddc->comp);
++	ret = zcomp_compress(zstrm, sddc->enc_pair + PAGE_SIZE, &slen);
++	if (!ret)
++		memcpy(sddc->enc_out, zstrm->buffer, slen);
++	zcomp_stream_put(sddc->comp);
++	if (ret)
++		return -EAGAIN;
++
++	shash = sddc_hash_bytes(sddc->enc_out, slen);
++
++	/* Let the caller store the raw page, exactly like the stock path. */
++	if (slen >= PAGE_SIZE || slen >= sddc->huge_class_size)
++		return -EAGAIN;
++
++	/* 2. collect candidates, pinning them while the bucket lock is held */
++	bucket = sddc_bucket(sddc, sample);
++	spin_lock(&sddc->bucket_lock);
++	for (i = 0; i < SDDC_BUCKET_WAYS && ncand < SDDC_MAX_CANDIDATES; i++) {
++		struct sddc_meta *c = sddc_get_locked(sddc, bucket->slot[i]);
++
++		if (c)
++			cand[ncand++] = c;
++	}
++	spin_unlock(&sddc->bucket_lock);
++
++	/* 3. exact stream match becomes an ALIAS */
++	for (i = 0; i < ncand; i++) {
++		if (cand[i]->wire_len != slen || cand[i]->stream_hash != shash)
++			continue;
++		sddc_read_stream(sddc, cand[i]->handle, slen, sddc->enc_tmp);
++		if (memcmp(sddc->enc_tmp, sddc->enc_out, slen))
++			continue;
++		meta = kzalloc(sizeof(*meta), GFP_NOIO);
++		if (!meta) {
++			ret = -ENOMEM;
++			goto drop;
++		}
++		meta->ref = cand[i];
++		meta->kind = SDDC_KIND_ALIAS;
++		meta->wire_len = 0;
++		meta->target_len = PAGE_SIZE;
++		meta->stream_hash = shash;
++		cand[i] = NULL;	/* the new slot takes over the pin */
++		atomic64_inc(&sddc->alias_hits);
++		out->meta = meta;
++		out->handle = 0;
++		out->size = 0;
++		goto drop;
++	}
++
++	/* 4. dictionary compression against the first useful candidate */
++	if (slen > PAGE_SIZE / 8 && zcomp_has_delta(sddc->comp)) {
++		for (i = 0; i < ncand; i++) {
++			struct sddc_meta *c = cand[i];
++
++			if (!c)
++				continue;
++
++			sddc_read_stream(sddc, c->handle, c->wire_len,
++					 sddc->enc_tmp);
++			zstrm = zcomp_stream_get(sddc->comp);
++			ret = zcomp_decompress(zstrm, sddc->enc_tmp,
++					       c->wire_len, sddc->enc_pair);
++			if (!ret)
++				ret = zcomp_compress_delta(zstrm,
++						sddc->enc_pair,
++						sddc->enc_pair + PAGE_SIZE,
++						&dlen, PAGE_SIZE);
++			if (!ret) {
++				if (SDDC_HDR_BYTES + dlen > PAGE_SIZE)
++					ret = -E2BIG;
++				else
++					memcpy(sddc->enc_out + SDDC_HDR_BYTES,
++					       zstrm->buffer, dlen);
++			}
++			zcomp_stream_put(sddc->comp);
++			if (ret)
++				continue;
++
++			wire_len = SDDC_HDR_BYTES + dlen;
++			if (wire_len + 8 >= slen)
++				continue;
++			if (zs_lookup_class_index(wire_len) >=
++			    zs_lookup_class_index(slen))
++				continue;
++
++			sel = i;
++			break;
++		}
++
++		if (sel >= 0) {
++			struct sddc_wire_hdr *hdr = sddc->enc_out;
++			struct sddc_meta *c = cand[sel];
++
++			memset(hdr, 0, SDDC_HDR_BYTES);
++			hdr->magic = SDDC_MAGIC;
++			hdr->version = SDDC_VERSION;
++			hdr->kind = SDDC_KIND_DELTA;
++			hdr->ref_hash = c->stream_hash;
++			hdr->target_len = PAGE_SIZE;
++			hdr->payload_len = dlen;
++			hdr->payload_hash = sddc_hash_bytes(sddc->enc_out +
++					SDDC_HDR_BYTES, dlen);
++
++			wire_len = SDDC_HDR_BYTES + dlen;
++			if (sddc_zs_write(sddc, sddc->enc_out, wire_len,
++					  &handle))
++				goto plain;
++
++			meta = kzalloc(sizeof(*meta), GFP_NOIO);
++			if (!meta) {
++				zs_free(sddc->pool, handle);
++				goto plain;
++			}
++			meta->ref = c;
++			meta->handle = handle;
++			meta->kind = SDDC_KIND_DELTA;
++			meta->wire_len = wire_len;
++			meta->target_len = PAGE_SIZE;
++			meta->stream_hash = c->stream_hash;
++			cand[sel] = NULL;	/* pin transferred to the new meta */
++			atomic64_inc(&sddc->delta_hits);
++			out->meta = meta;
++			out->handle = handle;
++			out->size = wire_len;
++			goto drop;
++		}
++	}
++	(void)shash;
++
++plain:
++	if (sddc_zs_write(sddc, sddc->enc_out, slen, &handle)) {
++		ret = -ENOMEM;
++		goto drop;
++	}
++
++	/* 5. promote the new slot to a reference when it is worth indexing */
++	if (slen >= SDDC_INDEX_MIN_BYTES && slen < sddc->huge_class_size) {
++		meta = kzalloc(sizeof(*meta), GFP_NOIO);
++		if (meta) {
++			meta->kind = SDDC_KIND_REF;
++			meta->handle = handle;
++			meta->wire_len = slen;
++			meta->target_len = PAGE_SIZE;
++			meta->stream_hash = shash;
++			meta->sample_hash = sample;
++			spin_lock(&sddc->bucket_lock);
++			sddc_index(sddc, meta);
++			spin_unlock(&sddc->bucket_lock);
++			out->meta = meta;
++			out->handle = handle;
++			out->size = slen;
++			goto drop;
++		}
++		atomic64_inc(&sddc->fallbacks);
++	}
++
++	out->meta = NULL;
++	out->handle = handle;
++	out->size = slen;
++	ret = 0;
++
++drop:
++	for (i = 0; i < ncand; i++)
++		if (cand[i])
++			sddc_put(sddc, cand[i]);
++	return ret;
++}
++
++/* Rebuild a page out of an SDDC slot.  Runs under the zram slot spinlock. */
++int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
++{
++	struct sddc_meta *meta = meta_ptr;
++	struct sddc_meta *ref;
++	struct zcomp_strm *zstrm;
++	struct sddc_wire_hdr *hdr;
++	void *pagebuf;
++	int ret = -EIO;
++
++	if (!meta)
++		return -EIO;
++
++	spin_lock(&sddc->dec_lock);
++
++	if (meta->kind == SDDC_KIND_REF || meta->kind == SDDC_KIND_ALIAS) {
++		ref = (meta->kind == SDDC_KIND_REF) ? meta : meta->ref;
++		if (!ref)
++			goto out;
++
++		sddc_read_stream(sddc, ref->handle, ref->wire_len,
++				 sddc->dec_tmp);
++		pagebuf = kmap_atomic(page);
++		zstrm = zcomp_stream_get(sddc->comp);
++		ret = zcomp_decompress(zstrm, sddc->dec_tmp, ref->wire_len,
++				       pagebuf);
++		zcomp_stream_put(sddc->comp);
++		kunmap_atomic(pagebuf);
++		if (ret)
++			atomic64_inc(&sddc->read_errors);
++		goto out;
++	}
++
++	if (meta->kind != SDDC_KIND_DELTA)
++		goto out;
++
++	ref = meta->ref;
++	if (!ref)
++		goto out;
++
++	sddc_read_stream(sddc, meta->handle, meta->wire_len, sddc->dec_hdr);
++	hdr = sddc->dec_hdr;
++	if (hdr->magic != SDDC_MAGIC || hdr->version != SDDC_VERSION ||
++	    hdr->kind != SDDC_KIND_DELTA ||
++	    hdr->payload_len + SDDC_HDR_BYTES != meta->wire_len ||
++	    hdr->ref_hash != ref->stream_hash ||
++	    hdr->payload_hash != sddc_hash_bytes(sddc->dec_hdr + SDDC_HDR_BYTES,
++						 hdr->payload_len)) {
++		atomic64_inc(&sddc->read_errors);
++		goto out;
++	}
++
++	sddc_read_stream(sddc, ref->handle, ref->wire_len, sddc->dec_tmp);
++	zstrm = zcomp_stream_get(sddc->comp);
++	ret = zcomp_decompress(zstrm, sddc->dec_tmp, ref->wire_len,
++			       sddc->dec_pair);
++	if (!ret) {
++		void *payload = sddc->dec_hdr + SDDC_HDR_BYTES;
++
++		ret = zcomp_decompress_delta(zstrm, payload, hdr->payload_len,
++					     sddc->dec_pair,
++					     sddc->dec_pair + PAGE_SIZE);
++		if (!ret) {
++			pagebuf = kmap_atomic(page);
++			memcpy(pagebuf, sddc->dec_pair + PAGE_SIZE, PAGE_SIZE);
++			kunmap_atomic(pagebuf);
++		} else {
++			atomic64_inc(&sddc->read_errors);
++		}
++	} else {
++		atomic64_inc(&sddc->read_errors);
++	}
++	zcomp_stream_put(sddc->comp);
++
++out:
++	spin_unlock(&sddc->dec_lock);
++	return ret;
++}
++
++void zram_sddc_free_slot(struct zram_sddc *sddc, void *meta_ptr)
++{
++	struct sddc_meta *meta = meta_ptr;
++	struct sddc_meta *ref = meta->ref;
++	int deps;
++
++	spin_lock(&sddc->bucket_lock);
++	if (meta->kind == SDDC_KIND_REF)
++		sddc_unindex(sddc, meta);
++	meta->orphan = 1;
++	deps = meta->dependents;
++	spin_unlock(&sddc->bucket_lock);
++
++	if (ref)
++		sddc_put(sddc, ref);
++
++	if (deps == 0)
++		meta->dependents = 1;	/* route through the common release */
++	if (meta->kind == SDDC_KIND_ALIAS || deps == 0)
++		sddc_put(sddc, meta);
++}
++
++struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
++				   unsigned long huge_class_size)
++{
++	struct zram_sddc *sddc;
++
++	if (!zcomp_has_delta(comp))
++		return NULL;
++
++	sddc = kzalloc(sizeof(*sddc), GFP_KERNEL);
++	if (!sddc)
++		return NULL;
++
++	sddc->pool = pool;
++	sddc->comp = comp;
++	sddc->huge_class_size = huge_class_size;
++	spin_lock_init(&sddc->bucket_lock);
++	mutex_init(&sddc->enc_lock);
++	spin_lock_init(&sddc->dec_lock);
++
++	sddc->buckets = vzalloc(array_size(SDDC_BUCKETS,
++					   sizeof(struct sddc_bucket)));
++	sddc->enc_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
++	sddc->enc_out = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++	sddc->enc_tmp = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++	sddc->dec_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
++	sddc->dec_hdr = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++	sddc->dec_tmp = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++
++	if (!sddc->buckets || !sddc->enc_pair || !sddc->enc_out ||
++	    !sddc->enc_tmp || !sddc->dec_pair || !sddc->dec_hdr ||
++	    !sddc->dec_tmp)
++		goto err;
++
++	return sddc;
++err:
++	zram_sddc_destroy(sddc);
++	return NULL;
++}
++
++void zram_sddc_destroy(struct zram_sddc *sddc)
++{
++	if (!sddc)
++		return;
++
++	vfree(sddc->buckets);
++	free_pages((unsigned long)sddc->enc_pair, 1);
++	free_page((unsigned long)sddc->enc_out);
++	free_page((unsigned long)sddc->enc_tmp);
++	free_pages((unsigned long)sddc->dec_pair, 1);
++	free_page((unsigned long)sddc->dec_hdr);
++	free_page((unsigned long)sddc->dec_tmp);
++	kfree(sddc);
++}
+diff --git a/drivers/block/zram/zram_sddc.h b/drivers/block/zram/zram_sddc.h
+new file mode 100644
+index 0000000..52f80b1
+--- /dev/null
++++ b/drivers/block/zram/zram_sddc.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * SDDC (slot deduplication / dictionary compression) for zram.
++ */
++
++#ifndef _ZRAM_SDDC_H_
++#define _ZRAM_SDDC_H_
++
++#include <linux/types.h>
++
++struct page;
++struct zs_pool;
++struct zcomp;
++struct zram_sddc;
++
++/* Result of a store attempt. */
++struct zram_sddc_store {
++	void *meta;		/* NULL: plain slot, no SDDC bookkeeping */
++	unsigned long handle;	/* zsmalloc handle (owned by the caller) */
++	unsigned int size;	/* bytes charged to compr_data_size */
++};
++
++struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
++				   unsigned long huge_class_size);
++void zram_sddc_destroy(struct zram_sddc *sddc);
++
++int zram_sddc_store(struct zram_sddc *sddc, struct page *page,
++		    struct zram_sddc_store *out);
++int zram_sddc_load(struct zram_sddc *sddc, void *meta, struct page *page);
++void zram_sddc_free_slot(struct zram_sddc *sddc, void *meta);
++
++#endif

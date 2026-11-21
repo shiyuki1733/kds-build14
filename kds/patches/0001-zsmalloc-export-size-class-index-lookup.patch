@@ -1,0 +1,39 @@
+From 1afd6f22ebc64cf65cd1e7957bb680b38ebd6058 Mon Sep 17 00:00:00 2001
+From: k <a@b>
+Date: Thu, 19 Nov 2026 22:09:30 +0800
+Subject: [PATCH 1/2] zsmalloc: export size class index lookup
+
+---
+ include/linux/zsmalloc.h | 1 +
+ mm/zsmalloc.c            | 6 ++++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/include/linux/zsmalloc.h b/include/linux/zsmalloc.h
+index 2a430e7..bf94bf6 100644
+--- a/include/linux/zsmalloc.h
++++ b/include/linux/zsmalloc.h
+@@ -47,6 +47,7 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t flags);
+ void zs_free(struct zs_pool *pool, unsigned long obj);
+ 
+ size_t zs_huge_class_size(struct zs_pool *pool);
++int zs_lookup_class_index(unsigned int size);
+ 
+ void *zs_map_object(struct zs_pool *pool, unsigned long handle,
+ 			enum zs_mapmode mm);
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index aede005..3724388 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -531,6 +531,12 @@ static int get_size_class_index(int size)
+ 	return min_t(int, ZS_SIZE_CLASSES - 1, idx);
+ }
+ 
++int zs_lookup_class_index(unsigned int size)
++{
++	return get_size_class_index(size);
++}
++EXPORT_SYMBOL_GPL(zs_lookup_class_index);
++
+ /* type can be of enum type class_stat_type or fullness_group */
+ static inline void class_stat_inc(struct size_class *class,
+ 				int type, unsigned long cnt)
