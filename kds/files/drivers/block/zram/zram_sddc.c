@@ -50,6 +50,7 @@
 #define SDDC_BUCKET_BITS	14
 #define SDDC_BUCKETS		(1U << SDDC_BUCKET_BITS)
 #define SDDC_BUCKET_WAYS	6
+#define SDDC_REF_CAP		32768
 #define SDDC_HASH_SEED		0x9e3779b9
 
 /* LZ4KD needs >= 5 bytes of delta input and the wire must fit one page. */
@@ -135,6 +136,7 @@ struct zram_sddc {
 	atomic64_t meta_alive;
 	atomic64_t alive_ref, alive_alias, alive_delta;
 	atomic64_t wq_pending, zs_fail;
+	atomic64_t ref_cap_skip;
 	atomic64_t delta_tried, miss_nodelta;
 	atomic64_t dry_tried, dry_ok, dry_refdec, dry_ddec, dry_rdiff;
 	atomic64_t ref_verify_fail, ref_read_fail;
@@ -186,7 +188,7 @@ static int sddc_zs_write(struct zram_sddc *sddc, const void *buf,
 	void *dst;
 
 	*handle = zs_malloc(sddc->pool, len,
-			    __GFP_KSWAPD_RECLAIM | __GFP_NOWARN |
+			    GFP_ATOMIC | __GFP_NOWARN |
 			    __GFP_HIGHMEM | __GFP_MOVABLE | __GFP_CMA);
 	if (IS_ERR((void *)*handle)) {
 		atomic64_inc(&sddc->zs_fail);
@@ -251,7 +253,7 @@ static void sddc_put(struct zram_sddc *sddc, struct sddc_meta *meta)
 
 static struct sddc_meta *sddc_meta_alloc(struct zram_sddc *sddc, int kind)
 {
-	struct sddc_meta *meta = kzalloc(sizeof(*meta), GFP_NOIO);
+	struct sddc_meta *meta = kzalloc(sizeof(*meta), GFP_ATOMIC | __GFP_NOWARN);
 	u32 gen;
 
 	if (!meta)
@@ -608,7 +610,8 @@ plain:
 	/* 5. promote the new slot to a reference when it is worth indexing.
 	 * The stream must first survive a decode round-trip, otherwise a
 	 * broken reference would poison every later delta that uses it. */
-	if (slen >= SDDC_INDEX_MIN_BYTES && slen < sddc->huge_class_size) {
+	if (slen >= SDDC_INDEX_MIN_BYTES && slen < sddc->huge_class_size &&
+	    atomic64_read(&sddc->alive_ref) < SDDC_REF_CAP) {
 		meta = sddc_meta_alloc(sddc, SDDC_KIND_REF);
 		if (meta) {
 			meta->handle = handle;
@@ -625,6 +628,9 @@ plain:
 			goto drop;
 		}
 		atomic64_inc(&sddc->fallbacks);
+	} else if (slen >= SDDC_INDEX_MIN_BYTES &&
+		   slen < sddc->huge_class_size) {
+		atomic64_inc(&sddc->ref_cap_skip);
 	}
 
 	out->meta = NULL;
@@ -918,7 +924,7 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu load_entries=%llu\n"
 		"re_pin=%llu re_plain=%llu re_hdr=%llu re_refdec=%llu re_ddec=%llu refverify=%llu\n"
 		"store=%llu cand=%llu miss_small=%llu miss_refdec=%llu miss_enc=%llu miss_size=%llu miss_proof=%llu miss_wire=%llu miss_class=%llu meta_alive=%lld mode=%d comp=%s has_delta=%d tried=%llu nodelta=%llu\n"
-		"alive_ref=%lld alive_alias=%lld alive_delta=%lld wq_pending=%lld zs_fail=%llu\n"
+		"alive_ref=%lld alive_alias=%lld alive_delta=%lld wq_pending=%lld zs_fail=%llu ref_cap=%llu\n"
 		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
 		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
 		"refdec_ret=%d ddec_ret=%d last_slen=%u last_dlen=%u last_wire=%u\n"
@@ -956,6 +962,7 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		(long long)atomic64_read(&sddc->alive_delta),
 		(long long)atomic64_read(&sddc->wq_pending),
 		(u64)atomic64_read(&sddc->zs_fail),
+		(u64)atomic64_read(&sddc->ref_cap_skip),
 		sddc->dbg_stage, sddc->dbg_magic, sddc->dbg_kind,
 		sddc->dbg_plen, sddc->dbg_wire,
 		sddc->dbg_ref_hash, sddc->dbg_hdr_ref,
