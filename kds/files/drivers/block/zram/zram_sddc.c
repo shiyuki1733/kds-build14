@@ -605,8 +605,6 @@ plain:
 		atomic64_inc(&sddc->fallbacks);
 	}
 
-plain_out:
-
 	out->meta = NULL;
 	out->handle = handle;
 	out->size = slen;
