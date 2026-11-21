@@ -133,6 +133,8 @@ struct zram_sddc {
 	atomic64_t miss_small, miss_refdec, miss_delta_enc, miss_delta_size;
 	atomic64_t miss_proof, miss_wire, miss_class;
 	atomic64_t meta_alive;
+	atomic64_t alive_ref, alive_alias, alive_delta;
+	atomic64_t wq_pending, zs_fail;
 	atomic64_t delta_tried, miss_nodelta;
 	atomic64_t dry_tried, dry_ok, dry_refdec, dry_ddec, dry_rdiff;
 	atomic64_t ref_verify_fail, ref_read_fail;
@@ -184,9 +186,12 @@ static int sddc_zs_write(struct zram_sddc *sddc, const void *buf,
 	void *dst;
 
 	*handle = zs_malloc(sddc->pool, len,
-			    GFP_NOIO | __GFP_HIGHMEM | __GFP_MOVABLE);
-	if (IS_ERR((void *)*handle))
+			    __GFP_KSWAPD_RECLAIM | __GFP_NOWARN |
+			    __GFP_HIGHMEM | __GFP_MOVABLE | __GFP_CMA);
+	if (IS_ERR((void *)*handle)) {
+		atomic64_inc(&sddc->zs_fail);
 		return -ENOMEM;
+	}
 
 	dst = zs_map_object(sddc->pool, *handle, ZS_MM_WO);
 	memcpy(dst, buf, len);
@@ -215,6 +220,13 @@ static void sddc_free_workfn(struct work_struct *work)
 
 	if (meta->handle)
 		zs_free(sddc->pool, meta->handle);
+	if (meta->kind == SDDC_KIND_REF)
+		atomic64_dec(&sddc->alive_ref);
+	else if (meta->kind == SDDC_KIND_ALIAS)
+		atomic64_dec(&sddc->alive_alias);
+	else
+		atomic64_dec(&sddc->alive_delta);
+	atomic64_dec(&sddc->wq_pending);
 	atomic64_dec(&sddc->meta_alive);
 	kfree(meta);
 }
@@ -231,8 +243,10 @@ static void sddc_put(struct zram_sddc *sddc, struct sddc_meta *meta)
 	last = (--meta->dependents == 0) && meta->orphan;
 	spin_unlock(&sddc->bucket_lock);
 
-	if (last)
+	if (last) {
+		atomic64_inc(&sddc->wq_pending);
 		queue_work(sddc->free_wq, &meta->free_work);
+	}
 }
 
 static struct sddc_meta *sddc_meta_alloc(struct zram_sddc *sddc, int kind)
@@ -252,6 +266,12 @@ static struct sddc_meta *sddc_meta_alloc(struct zram_sddc *sddc, int kind)
 	meta->gen = gen;
 	INIT_WORK(&meta->free_work, sddc_free_workfn);
 	atomic64_inc(&sddc->meta_alive);
+	if (kind == SDDC_KIND_REF)
+		atomic64_inc(&sddc->alive_ref);
+	else if (kind == SDDC_KIND_ALIAS)
+		atomic64_inc(&sddc->alive_alias);
+	else
+		atomic64_inc(&sddc->alive_delta);
 	return meta;
 }
 
@@ -898,6 +918,7 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu load_entries=%llu\n"
 		"re_pin=%llu re_plain=%llu re_hdr=%llu re_refdec=%llu re_ddec=%llu refverify=%llu\n"
 		"store=%llu cand=%llu miss_small=%llu miss_refdec=%llu miss_enc=%llu miss_size=%llu miss_proof=%llu miss_wire=%llu miss_class=%llu meta_alive=%lld mode=%d comp=%s has_delta=%d tried=%llu nodelta=%llu\n"
+		"alive_ref=%lld alive_alias=%lld alive_delta=%lld wq_pending=%lld zs_fail=%llu\n"
 		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
 		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
 		"refdec_ret=%d ddec_ret=%d last_slen=%u last_dlen=%u last_wire=%u\n"
@@ -926,6 +947,11 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		(u64)atomic64_read(&sddc->miss_wire),
 		(u64)atomic64_read(&sddc->miss_class),
 		(long long)atomic64_read(&sddc->meta_alive),
+		(long long)atomic64_read(&sddc->alive_ref),
+		(long long)atomic64_read(&sddc->alive_alias),
+		(long long)atomic64_read(&sddc->alive_delta),
+		(long long)atomic64_read(&sddc->wq_pending),
+		(u64)atomic64_read(&sddc->zs_fail),
 		atomic_read(&sddc->mode),
 		sddc->comp_name, (int)sddc->has_delta,
 		(u64)atomic64_read(&sddc->delta_tried),
