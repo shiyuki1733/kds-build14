@@ -51,6 +51,7 @@
 #define SDDC_BUCKETS		(1U << SDDC_BUCKET_BITS)
 #define SDDC_BUCKET_WAYS	6
 #define SDDC_REF_CAP		32768
+#define SDDC_DELTA_CAP		262144
 #define SDDC_HASH_SEED		0x9e3779b9
 
 /* LZ4KD needs >= 5 bytes of delta input and the wire must fit one page. */
@@ -75,7 +76,6 @@ struct sddc_wire_hdr {
 	u32 target_len;
 	u32 payload_len;
 	u32 payload_hash;
-	u32 reserved;
 } __packed;
 
 struct sddc_meta {
@@ -136,7 +136,7 @@ struct zram_sddc {
 	atomic64_t meta_alive;
 	atomic64_t alive_ref, alive_alias, alive_delta;
 	atomic64_t wq_pending, zs_fail;
-	atomic64_t ref_cap_skip;
+	atomic64_t ref_cap_skip, delta_cap_skip;
 	atomic64_t delta_tried, miss_nodelta;
 	atomic64_t dry_tried, dry_ok, dry_refdec, dry_ddec, dry_rdiff;
 	atomic64_t ref_verify_fail, ref_read_fail;
@@ -497,6 +497,17 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 				atomic64_inc(&sddc->miss_delta_size);
 			}
 			if (!ret) {
+				wire_len = SDDC_HDR_BYTES + dlen;
+				if (wire_len + 8 >= slen) {
+					ret = -E2BIG;
+					atomic64_inc(&sddc->miss_wire);
+				} else if (zs_lookup_class_index(wire_len) >=
+					   zs_lookup_class_index(slen)) {
+					ret = -E2BIG;
+					atomic64_inc(&sddc->miss_class);
+				}
+			}
+			if (!ret) {
 				memcpy(payload, zstrm->buffer, dlen);
 				if (trace)
 					SDDC_MARK("d-copy", i, dlen);
@@ -542,17 +553,6 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 			if (ret)
 				continue;
 
-			wire_len = SDDC_HDR_BYTES + dlen;
-			if (wire_len + 8 >= slen) {
-				atomic64_inc(&sddc->miss_wire);
-				continue;
-			}
-			if (zs_lookup_class_index(wire_len) >=
-			    zs_lookup_class_index(slen)) {
-				atomic64_inc(&sddc->miss_class);
-				continue;
-			}
-
 			sel = i;
 			break;
 		}
@@ -560,6 +560,12 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 		if (sel >= 0) {
 			struct sddc_wire_hdr *hdr = sddc->enc_out;
 			struct sddc_meta *c = cand[sel];
+
+			if (atomic64_read(&sddc->alive_delta) >=
+			    SDDC_DELTA_CAP) {
+				atomic64_inc(&sddc->delta_cap_skip);
+				goto plain;
+			}
 
 			memset(hdr, 0, SDDC_HDR_BYTES);
 			hdr->magic = SDDC_MAGIC;
@@ -924,7 +930,7 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu load_entries=%llu\n"
 		"re_pin=%llu re_plain=%llu re_hdr=%llu re_refdec=%llu re_ddec=%llu refverify=%llu\n"
 		"store=%llu cand=%llu miss_small=%llu miss_refdec=%llu miss_enc=%llu miss_size=%llu miss_proof=%llu miss_wire=%llu miss_class=%llu meta_alive=%lld mode=%d comp=%s has_delta=%d tried=%llu nodelta=%llu\n"
-		"alive_ref=%lld alive_alias=%lld alive_delta=%lld wq_pending=%lld zs_fail=%llu ref_cap=%llu\n"
+		"alive_ref=%lld alive_alias=%lld alive_delta=%lld wq_pending=%lld zs_fail=%llu ref_cap=%llu delta_cap=%llu\n"
 		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
 		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
 		"refdec_ret=%d ddec_ret=%d last_slen=%u last_dlen=%u last_wire=%u\n"
@@ -963,6 +969,7 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		(long long)atomic64_read(&sddc->wq_pending),
 		(u64)atomic64_read(&sddc->zs_fail),
 		(u64)atomic64_read(&sddc->ref_cap_skip),
+		(u64)atomic64_read(&sddc->delta_cap_skip),
 		sddc->dbg_stage, sddc->dbg_magic, sddc->dbg_kind,
 		sddc->dbg_plen, sddc->dbg_wire,
 		sddc->dbg_ref_hash, sddc->dbg_hdr_ref,
