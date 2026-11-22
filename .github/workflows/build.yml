@@ -288,6 +288,9 @@ jobs:
           git clone https://github.com/WildKernels/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
           rm -rf AnyKernel3/.git
 
+          echo "注入 erofs.reserved_pages=64 cmdline..."
+          grep -q erofs.reserved_pages AnyKernel3/anykernel.sh || sed -i '/^split_boot$/a patch_cmdline "erofs.reserved_pages" "erofs.reserved_pages=64"' AnyKernel3/anykernel.sh
+
           echo "克隆 SUSFS (分支: $SUSFS_BRANCH)..."
           # 上游没有对应 SUSFS 分支时自动跳过 SUSFS，避免中断构建
           susfs_branch_missing() {
