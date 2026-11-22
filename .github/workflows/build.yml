@@ -1915,7 +1915,13 @@ jobs:
                 if [ "$(printf '%s\n' "6.12" "$KVER_NUM" | sort -V | head -1)" = "6.12" ]; then
                   LTO_FLAG="--lto=none"
                 fi
-                tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast $LTO_FLAG $FRAG_FLAG //common:kernel_aarch64_dist || exit 1
+                LTO_CFG=$(tr -d " \r\n" < "$GITHUB_WORKSPACE/kds/config/lto" 2>/dev/null)
+                if [ -n "$LTO_CFG" ]; then
+                  LTO_FLAG="--lto=$LTO_CFG"
+                fi
+                BAZEL_EXTRA=$(tr -d "\r\n" < "$GITHUB_WORKSPACE/kds/config/bazel_flags" 2>/dev/null)
+                echo "LTO_FLAG=$LTO_FLAG BAZEL_EXTRA=$BAZEL_EXTRA"
+                tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast $LTO_FLAG $FRAG_FLAG $BAZEL_EXTRA //common:kernel_aarch64_dist || exit 1
                 strings ./bazel-bin/common/kernel_aarch64/Image | grep 'Linux version'
               fi
 
