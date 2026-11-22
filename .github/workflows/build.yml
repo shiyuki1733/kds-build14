@@ -1920,8 +1920,13 @@ jobs:
                   LTO_FLAG="--lto=$LTO_CFG"
                 fi
                 BAZEL_EXTRA=$(tr -d "\r\n" < "$GITHUB_WORKSPACE/kds/config/bazel_flags" 2>/dev/null)
-                echo "LTO_FLAG=$LTO_FLAG BAZEL_EXTRA=$BAZEL_EXTRA"
-                tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast $LTO_FLAG $FRAG_FLAG $BAZEL_EXTRA //common:kernel_aarch64_dist || exit 1
+                TGT="//common:kernel_aarch64_dist"
+                if [ -f "$GITHUB_WORKSPACE/kds/config/no_modules" ]; then
+                  sed -i '0,/^    "modules",$/{s/^    "modules",$//}' common/BUILD.bazel
+                  TGT="//common:kernel_aarch64"
+                fi
+                echo "LTO_FLAG=$LTO_FLAG BAZEL_EXTRA=$BAZEL_EXTRA TGT=$TGT"
+                tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast $LTO_FLAG $FRAG_FLAG $BAZEL_EXTRA $TGT || exit 1
                 strings ./bazel-bin/common/kernel_aarch64/Image | grep 'Linux version'
               fi
 
