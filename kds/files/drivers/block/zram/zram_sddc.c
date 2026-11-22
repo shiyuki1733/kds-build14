@@ -50,8 +50,8 @@
 #define SDDC_BUCKET_BITS	14
 #define SDDC_BUCKETS		(1U << SDDC_BUCKET_BITS)
 #define SDDC_BUCKET_WAYS	6
-#define SDDC_REF_CAP		32768
-#define SDDC_DELTA_CAP		262144
+#define SDDC_REF_CAP		65536
+#define SDDC_DELTA_CAP		524288
 #define SDDC_HASH_SEED		0x9e3779b9
 
 /* LZ4KD needs >= 5 bytes of delta input and the wire must fit one page. */
