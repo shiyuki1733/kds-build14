@@ -32,5 +32,6 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len);
 
 int zram_sddc_mode_get(struct zram_sddc *sddc);
 void zram_sddc_mode_set(struct zram_sddc *sddc, int mode);
+void zram_sddc_get_stats(struct zram_sddc *sddc, u64 *out);
 
 #endif

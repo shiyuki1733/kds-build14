@@ -49,6 +49,15 @@ dedupe() {
 	awk '!/^CONFIG_/ || !seen[$0]++' "$f" > "$f.kdstmp" && mv "$f.kdstmp" "$f"
 }
 
+if [ -d "$HERE"/files/drivers/kdsprobe ]; then
+	mkdir -p "$KERNEL"/drivers/kdsprobe
+	cp "$HERE"/files/drivers/kdsprobe/* "$KERNEL"/drivers/kdsprobe/
+	grep -q 'drivers/kdsprobe/Kconfig' "$KERNEL"/drivers/Kconfig || \
+		echo 'source "drivers/kdsprobe/Kconfig"' >> "$KERNEL"/drivers/Kconfig
+	grep -q 'kdsprobe/' "$KERNEL"/drivers/Makefile || \
+		echo 'obj-$(CONFIG_KDSPROBE) += kdsprobe/' >> "$KERNEL"/drivers/Makefile
+fi
+
 for cfg in "$KERNEL"/arch/arm64/configs/gki_defconfig "$KERNEL"/arch/arm64/configs/ksu.fragment; do
 	if [ -f "$cfg" ]; then
 		grep -q CONFIG_ZRAM_SDDC "$cfg" || cat "$HERE"/config/kds.fragment >> "$cfg"

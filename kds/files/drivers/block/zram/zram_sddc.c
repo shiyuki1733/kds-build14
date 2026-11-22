@@ -1003,3 +1003,25 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		sddc->dbg_store_refdec_ret, sddc->dbg_store_wire, sh,
 		rh, th, ph, sddc->dbg_st_off, sddc->dbg_pg_off);
 }
+
+void zram_sddc_get_stats(struct zram_sddc *sddc, u64 *out)
+{
+	int i;
+
+	for (i = 0; i < 10; i++)
+		out[i] = 0;
+	if (!sddc) {
+		out[9] = 1;
+		return;
+	}
+	out[0] = (u64)atomic64_read(&sddc->alias_hits);
+	out[1] = (u64)atomic64_read(&sddc->delta_hits);
+	out[2] = (u64)atomic64_read(&sddc->meta_alive);
+	out[3] = (u64)atomic64_read(&sddc->alive_ref);
+	out[4] = (u64)atomic64_read(&sddc->alive_alias);
+	out[5] = (u64)atomic64_read(&sddc->alive_delta);
+	out[6] = (u64)atomic64_read(&sddc->ref_cap_skip);
+	out[7] = (u64)atomic64_read(&sddc->delta_cap_skip);
+	out[8] = (u64)atomic64_read(&sddc->read_errors);
+	out[9] = (u64)atomic64_read(&sddc->proof_failures);
+}

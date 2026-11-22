@@ -2257,6 +2257,27 @@ out_error:
 	return ret;
 }
 
+int zram_kds_stats(u64 *mm, u64 *sd)
+{
+	struct zram *zram = idr_find(&zram_index_idr, 0);
+	int i;
+
+	for (i = 0; i < 10; i++)
+		sd[i] = 0;
+	if (!zram)
+		return -ENODEV;
+
+	down_read(&zram->init_lock);
+	mm[0] = (u64)atomic64_read(&zram->stats.pages_stored) << PAGE_SHIFT;
+	mm[1] = (u64)atomic64_read(&zram->stats.compr_data_size);
+	mm[2] = init_done(zram) ? (u64)zs_get_total_pages(zram->mem_pool) << PAGE_SHIFT : 0;
+#ifdef CONFIG_ZRAM_SDDC
+	zram_sddc_get_stats(zram->sddc, sd);
+#endif
+	up_read(&zram->init_lock);
+	return 0;
+}
+
 static void __exit zram_exit(void)
 {
 	destroy_devices();

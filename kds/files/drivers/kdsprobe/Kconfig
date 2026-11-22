@@ -1,0 +1,5 @@
+config KDSPROBE
+	bool "kds companion probe (proc sampler)"
+	default n
+	help
+	  Exposes /proc/kdsprobe/{ctl,snap,report} for idle/memory/swap/zram sampling.
