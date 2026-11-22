@@ -319,10 +319,26 @@ static void sddc_unindex(struct zram_sddc *sddc, struct sddc_meta *meta)
 	}
 }
 
+/*
+ * Replacement score, mirroring the upstream Huawei heuristic: a less-shared
+ * reference makes a better victim; on a tie the smaller stream is evicted
+ * first; a one-use incumbent rotates so the table is not pinned by its first
+ * occupants.  Returns true when @cand is a better victim than @inc.
+ */
+static bool sddc_index_better_victim(const struct sddc_meta *inc,
+				     const struct sddc_meta *cand)
+{
+	if (cand->dependents != inc->dependents)
+		return cand->dependents < inc->dependents;
+	if (cand->wire_len != inc->wire_len)
+		return cand->wire_len < inc->wire_len;
+	return inc->dependents <= 2;
+}
+
 static void sddc_index(struct zram_sddc *sddc, struct sddc_meta *meta)
 {
 	struct sddc_bucket *b = sddc_bucket(sddc, meta->sample_hash);
-	int i, victim;
+	int i, victim = -1;
 
 	for (i = 0; i < SDDC_BUCKET_WAYS; i++) {
 		if (b->slot[i] == meta)
@@ -330,12 +346,15 @@ static void sddc_index(struct zram_sddc *sddc, struct sddc_meta *meta)
 	}
 	for (i = 0; i < SDDC_BUCKET_WAYS; i++) {
 		if (!b->slot[i]) {
-			b->slot[i] = meta;
-			return;
+			victim = i;
+			break;
 		}
+		if (victim < 0 ||
+		    sddc_index_better_victim(b->slot[victim], b->slot[i]))
+			victim = i;
 	}
-	/* Bucket full: replace a random-ish entry, the old REF stays valid. */
-	victim = sddc_hash_bytes(meta, sizeof(meta)) % SDDC_BUCKET_WAYS;
+	if (victim < 0)
+		return;
 	b->slot[victim] = meta;
 }
 
