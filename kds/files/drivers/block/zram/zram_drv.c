@@ -1867,7 +1867,10 @@ static ssize_t disksize_store(struct device *dev,
 
 	zram->comp = comp;
 #ifdef CONFIG_ZRAM_SDDC
-	zram->sddc = zram_sddc_create(zram->mem_pool, comp, huge_class_size);
+	if (zcomp_has_delta(comp))
+		zram->sddc = zram_sddc_create(zram->mem_pool, comp, huge_class_size);
+	else
+		zram->sddc = NULL;
 #endif
 	zram->disksize = disksize;
 	set_capacity_and_notify(zram->disk, zram->disksize >> SECTOR_SHIFT);
