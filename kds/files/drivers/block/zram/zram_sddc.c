@@ -141,6 +141,7 @@ struct zram_sddc {
 	atomic64_t dry_tried, dry_ok, dry_refdec, dry_ddec, dry_rdiff;
 	atomic64_t ref_verify_fail, ref_read_fail;
 	atomic_t mode;		/* 0 off, 1 alias only, 2 alias+delta */
+	atomic_t cand_max;	/* delta candidates tried per store */
 	bool fail_zero;		/* zero-fill instead of EIO on load failure */
 	char comp_name[16];
 	bool has_delta;
@@ -461,7 +462,8 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 		if (!sddc->has_delta) {
 			atomic64_inc(&sddc->miss_nodelta);
 		} else {
-		for (i = 0; i < ncand; i++) {
+		int cmax = atomic_read(&sddc->cand_max);
+		for (i = 0; i < ncand && i < cmax; i++) {
 			struct sddc_meta *c = cand[i];
 			void *payload = sddc->enc_out + SDDC_HDR_BYTES;
 			bool proof_bad = false;
@@ -857,6 +859,7 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	mutex_init(&sddc->enc_lock);
 	spin_lock_init(&sddc->dec_lock);
 	atomic_set(&sddc->mode, 2);
+	atomic_set(&sddc->cand_max, 2);
 	atomic_set(&sddc->next_gen, 0);
 	sddc->fail_zero = false;
 	sddc->free_wq = alloc_workqueue("kds-sddc-free", WQ_UNBOUND, 0);
@@ -910,6 +913,22 @@ void zram_sddc_destroy(struct zram_sddc *sddc)
 	free_page((unsigned long)sddc->dec_hdr);
 	free_page((unsigned long)sddc->dec_tmp);
 	kfree(sddc);
+}
+
+int zram_sddc_cand_get(struct zram_sddc *sddc)
+{
+	return sddc ? atomic_read(&sddc->cand_max) : 0;
+}
+
+void zram_sddc_cand_set(struct zram_sddc *sddc, int n)
+{
+	if (!sddc)
+		return;
+	if (n < 1)
+		n = 1;
+	if (n > SDDC_MAX_CANDIDATES)
+		n = SDDC_MAX_CANDIDATES;
+	atomic_set(&sddc->cand_max, n);
 }
 
 int zram_sddc_mode_get(struct zram_sddc *sddc)

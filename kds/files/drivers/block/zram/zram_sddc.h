@@ -31,6 +31,8 @@ void zram_sddc_free_slot(struct zram_sddc *sddc, void *meta);
 ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len);
 
 int zram_sddc_mode_get(struct zram_sddc *sddc);
+int zram_sddc_cand_get(struct zram_sddc *sddc);
+void zram_sddc_cand_set(struct zram_sddc *sddc, int n);
 void zram_sddc_mode_set(struct zram_sddc *sddc, int mode);
 void zram_sddc_get_stats(struct zram_sddc *sddc, u64 *out);
 

@@ -1194,6 +1194,28 @@ static ssize_t sddc_mode_store(struct device *dev,
 	return len;
 }
 static DEVICE_ATTR_RW(sddc_mode);
+
+static ssize_t sddc_cand_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+
+	return sprintf(buf, "%d\n", zram_sddc_cand_get(zram->sddc));
+}
+
+static ssize_t sddc_cand_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct zram *zram = dev_to_zram(dev);
+	int n;
+
+	if (kstrtoint(buf, 0, &n))
+		return -EINVAL;
+	zram_sddc_cand_set(zram->sddc, n);
+	return len;
+}
+
+static DEVICE_ATTR_RW(sddc_cand);
 #endif
 
 static DEVICE_ATTR_RO(io_stat);
@@ -1989,6 +2011,7 @@ static struct attribute *zram_disk_attrs[] = {
 #ifdef CONFIG_ZRAM_SDDC
 	&dev_attr_sddc_stat.attr,
 	&dev_attr_sddc_mode.attr,
+	&dev_attr_sddc_cand.attr,
 #endif
 	NULL,
 };
