@@ -859,7 +859,7 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	mutex_init(&sddc->enc_lock);
 	spin_lock_init(&sddc->dec_lock);
 	atomic_set(&sddc->mode, 2);
-	atomic_set(&sddc->cand_max, 2);
+	atomic_set(&sddc->cand_max, 1);
 	atomic_set(&sddc->next_gen, 0);
 	sddc->fail_zero = false;
 	sddc->free_wq = alloc_workqueue("kds-sddc-free", WQ_UNBOUND, 0);
