@@ -36,6 +36,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
+#include <linux/vmstat.h>
 #include <linux/workqueue.h>
 #include <linux/zsmalloc.h>
 
@@ -133,6 +134,7 @@ struct zram_sddc {
 	atomic64_t cand_total;
 	atomic64_t miss_small, miss_refdec, miss_delta_enc, miss_delta_size;
 	atomic64_t miss_proof, miss_wire, miss_class;
+	atomic64_t miss_save, miss_pressure;
 	atomic64_t meta_alive;
 	atomic64_t alive_ref, alive_alias, alive_delta;
 	atomic64_t wq_pending, zs_fail;
@@ -143,6 +145,8 @@ struct zram_sddc {
 	atomic_t mode;		/* 0 off, 1 alias only, 2 alias+delta */
 	atomic_t cand_max;	/* delta candidates tried per store */
 	atomic_t ref_cap;	/* max live REF slots */
+	atomic_t min_save_pct;	/* min plain-stream savings to accept a delta, % */
+	atomic_t pressure_gate;	/* skip delta under memory pressure */
 	bool fail_zero;		/* zero-fill instead of EIO on load failure */
 	char comp_name[16];
 	bool has_delta;
@@ -365,6 +369,14 @@ static void sddc_index(struct zram_sddc *sddc, struct sddc_meta *meta)
  * itself failed; -EAGAIN when the caller must use the compression it already
  * performed elsewhere.
  */
+static bool sddc_mem_pressured(void)
+{
+	unsigned long free = global_zone_page_state(NR_FREE_PAGES);
+	unsigned long min = min_free_kbytes << (PAGE_SHIFT - 10);
+
+	return free <= min;
+}
+
 static int sddc_store(struct zram_sddc *sddc, struct page *page,
 		      struct zram_sddc_store *out);
 
@@ -462,6 +474,9 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 	if (atomic_read(&sddc->mode) >= 2 && slen > PAGE_SIZE / 8) {
 		if (!sddc->has_delta) {
 			atomic64_inc(&sddc->miss_nodelta);
+		} else if (atomic_read(&sddc->pressure_gate) &&
+			   sddc_mem_pressured()) {
+			atomic64_inc(&sddc->miss_pressure);
 		} else {
 		int cmax = atomic_read(&sddc->cand_max);
 		for (i = 0; i < ncand && i < cmax; i++) {
@@ -527,6 +542,15 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 					   zs_lookup_class_index(slen)) {
 					ret = -E2BIG;
 					atomic64_inc(&sddc->miss_class);
+				} else {
+					unsigned int pct = atomic_read(&sddc->min_save_pct);
+					unsigned long save = slen - wire_len;
+					unsigned long need = max(64UL, slen * pct / 100);
+
+					if (pct && save < need) {
+						ret = -E2BIG;
+						atomic64_inc(&sddc->miss_save);
+					}
 				}
 			}
 			if (!ret) {
@@ -862,6 +886,8 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	atomic_set(&sddc->mode, 2);
 	atomic_set(&sddc->cand_max, 1);
 	atomic_set(&sddc->ref_cap, 131072);
+	atomic_set(&sddc->min_save_pct, 10);
+	atomic_set(&sddc->pressure_gate, 1);
 	atomic_set(&sddc->next_gen, 0);
 	sddc->fail_zero = false;
 	sddc->free_wq = alloc_workqueue("kds-sddc-free", WQ_UNBOUND, 0);
@@ -938,6 +964,34 @@ void zram_sddc_refcap_set(struct zram_sddc *sddc, int n)
 	atomic_set(&sddc->ref_cap, n);
 }
 
+int zram_sddc_minsave_get(struct zram_sddc *sddc)
+{
+	return sddc ? atomic_read(&sddc->min_save_pct) : 0;
+}
+
+void zram_sddc_minsave_set(struct zram_sddc *sddc, int n)
+{
+	if (!sddc)
+		return;
+	if (n < 0)
+		n = 0;
+	if (n > 50)
+		n = 50;
+	atomic_set(&sddc->min_save_pct, n);
+}
+
+int zram_sddc_pressure_get(struct zram_sddc *sddc)
+{
+	return sddc ? atomic_read(&sddc->pressure_gate) : 0;
+}
+
+void zram_sddc_pressure_set(struct zram_sddc *sddc, int n)
+{
+	if (!sddc)
+		return;
+	atomic_set(&sddc->pressure_gate, !!n);
+}
+
 void zram_sddc_cand_set(struct zram_sddc *sddc, int n)
 {
 	if (!sddc)
@@ -985,7 +1039,7 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 	return scnprintf(buf, len,
 		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu load_entries=%llu\n"
 		"re_pin=%llu re_plain=%llu re_hdr=%llu re_refdec=%llu re_ddec=%llu refverify=%llu\n"
-		"store=%llu cand=%llu miss_small=%llu miss_refdec=%llu miss_enc=%llu miss_size=%llu miss_proof=%llu miss_wire=%llu miss_class=%llu meta_alive=%lld mode=%d comp=%s has_delta=%d tried=%llu nodelta=%llu\n"
+		"store=%llu cand=%llu miss_small=%llu miss_refdec=%llu miss_enc=%llu miss_size=%llu miss_proof=%llu miss_wire=%llu miss_class=%llu miss_save=%llu miss_pressure=%llu meta_alive=%lld mode=%d comp=%s has_delta=%d tried=%llu nodelta=%llu\n"
 		"alive_ref=%lld alive_alias=%lld alive_delta=%lld wq_pending=%lld zs_fail=%llu ref_cap=%llu delta_cap=%llu\n"
 		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
 		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
@@ -1014,6 +1068,8 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		(u64)atomic64_read(&sddc->miss_proof),
 		(u64)atomic64_read(&sddc->miss_wire),
 		(u64)atomic64_read(&sddc->miss_class),
+		(u64)atomic64_read(&sddc->miss_save),
+		(u64)atomic64_read(&sddc->miss_pressure),
 		(long long)atomic64_read(&sddc->meta_alive),
 		atomic_read(&sddc->mode),
 		sddc->comp_name, (int)sddc->has_delta,

@@ -35,6 +35,10 @@ int zram_sddc_cand_get(struct zram_sddc *sddc);
 void zram_sddc_cand_set(struct zram_sddc *sddc, int n);
 int zram_sddc_refcap_get(struct zram_sddc *sddc);
 void zram_sddc_refcap_set(struct zram_sddc *sddc, int n);
+int zram_sddc_minsave_get(struct zram_sddc *sddc);
+void zram_sddc_minsave_set(struct zram_sddc *sddc, int n);
+int zram_sddc_pressure_get(struct zram_sddc *sddc);
+void zram_sddc_pressure_set(struct zram_sddc *sddc, int n);
 void zram_sddc_mode_set(struct zram_sddc *sddc, int mode);
 void zram_sddc_get_stats(struct zram_sddc *sddc, u64 *out);
 

@@ -1238,6 +1238,50 @@ static ssize_t sddc_refcap_store(struct device *dev,
 }
 
 static DEVICE_ATTR_RW(sddc_refcap);
+
+static ssize_t sddc_minsave_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+
+	return sprintf(buf, "%d\n", zram_sddc_minsave_get(zram->sddc));
+}
+
+static ssize_t sddc_minsave_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct zram *zram = dev_to_zram(dev);
+	int n;
+
+	if (kstrtoint(buf, 0, &n))
+		return -EINVAL;
+	zram_sddc_minsave_set(zram->sddc, n);
+	return len;
+}
+
+static DEVICE_ATTR_RW(sddc_minsave);
+
+static ssize_t sddc_pressure_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+
+	return sprintf(buf, "%d\n", zram_sddc_pressure_get(zram->sddc));
+}
+
+static ssize_t sddc_pressure_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct zram *zram = dev_to_zram(dev);
+	int n;
+
+	if (kstrtoint(buf, 0, &n))
+		return -EINVAL;
+	zram_sddc_pressure_set(zram->sddc, n);
+	return len;
+}
+
+static DEVICE_ATTR_RW(sddc_pressure);
 #endif
 
 static DEVICE_ATTR_RO(io_stat);
@@ -2035,6 +2079,8 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_sddc_mode.attr,
 	&dev_attr_sddc_cand.attr,
 	&dev_attr_sddc_refcap.attr,
+	&dev_attr_sddc_minsave.attr,
+	&dev_attr_sddc_pressure.attr,
 #endif
 	NULL,
 };
