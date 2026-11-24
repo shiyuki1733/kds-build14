@@ -142,6 +142,7 @@ struct zram_sddc {
 	atomic64_t ref_verify_fail, ref_read_fail;
 	atomic_t mode;		/* 0 off, 1 alias only, 2 alias+delta */
 	atomic_t cand_max;	/* delta candidates tried per store */
+	atomic_t ref_cap;	/* max live REF slots */
 	bool fail_zero;		/* zero-fill instead of EIO on load failure */
 	char comp_name[16];
 	bool has_delta;
@@ -638,7 +639,7 @@ plain:
 	 * The stream must first survive a decode round-trip, otherwise a
 	 * broken reference would poison every later delta that uses it. */
 	if (slen >= SDDC_INDEX_MIN_BYTES && slen < sddc->huge_class_size &&
-	    atomic64_read(&sddc->alive_ref) < SDDC_REF_CAP) {
+	    atomic64_read(&sddc->alive_ref) < atomic_read(&sddc->ref_cap)) {
 		meta = sddc_meta_alloc(sddc, SDDC_KIND_REF);
 		if (meta) {
 			meta->handle = handle;
@@ -860,6 +861,7 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	spin_lock_init(&sddc->dec_lock);
 	atomic_set(&sddc->mode, 2);
 	atomic_set(&sddc->cand_max, 1);
+	atomic_set(&sddc->ref_cap, 131072);
 	atomic_set(&sddc->next_gen, 0);
 	sddc->fail_zero = false;
 	sddc->free_wq = alloc_workqueue("kds-sddc-free", WQ_UNBOUND, 0);
@@ -918,6 +920,22 @@ void zram_sddc_destroy(struct zram_sddc *sddc)
 int zram_sddc_cand_get(struct zram_sddc *sddc)
 {
 	return sddc ? atomic_read(&sddc->cand_max) : 0;
+}
+
+int zram_sddc_refcap_get(struct zram_sddc *sddc)
+{
+	return sddc ? atomic_read(&sddc->ref_cap) : 0;
+}
+
+void zram_sddc_refcap_set(struct zram_sddc *sddc, int n)
+{
+	if (!sddc)
+		return;
+	if (n < 16384)
+		n = 16384;
+	if (n > 262144)
+		n = 262144;
+	atomic_set(&sddc->ref_cap, n);
 }
 
 void zram_sddc_cand_set(struct zram_sddc *sddc, int n)
